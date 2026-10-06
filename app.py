@@ -39,7 +39,19 @@ if not check_password():
 
 BASE_URL = "https://graph.facebook.com"
 API_VERSION = st.secrets.get("META_API_VERSION", "v17.0")
-ACCESS_TOKEN = st.secrets["META_ACCESS_TOKEN"]
+# Multi token Meta API support
+META_TOKENS = st.secrets.get("META_ACCESS_TOKENS", [])
+
+if isinstance(META_TOKENS, str):
+    META_TOKENS = [META_TOKENS]
+
+# Backward compatibility with old single token secret
+if not META_TOKENS:
+    old_token = st.secrets.get("META_ACCESS_TOKEN", "")
+    if old_token:
+        META_TOKENS = [old_token]
+
+ACCESS_TOKENS = [str(t).strip() for t in META_TOKENS if str(t).strip()]
 BUSINESS_IDS = ["751488620224306", "1178859133269743"]
 FETCH_CAMPAIGNS = True  # Needed to fetch campaign status (Active / Not Active)
 REFRESH_LOCK_MAX_AGE_SECONDS = 10 * 60
@@ -995,22 +1007,51 @@ def load_snapshot():
 # -----------------------------
 @st.cache_data(ttl=1800)
 def fetch_all_pages(url, params=None):
+    """
+    Fetch Meta Graph API pages using all configured access tokens.
+    Results from multiple tokens are merged and deduplicated later.
+    """
+    params = params.copy() if params else {}
+    tokens = params.pop("access_token", None)
+
+    if not tokens:
+        tokens = ACCESS_TOKENS
+
+    if isinstance(tokens, str):
+        tokens = [tokens]
+
     all_rows = []
 
-    while True:
-        response = requests.get(url, params=params, timeout=90)
-        response.raise_for_status()
-        data = response.json()
+    for token in tokens:
+        try:
+            token_params = params.copy()
+            token_params["access_token"] = token
 
-        all_rows.extend(data.get("data", []))
+            current_url = url
+            current_params = token_params
 
-        paging = data.get("paging", {})
-        next_url = paging.get("next")
-        if not next_url:
-            break
+            while True:
+                response = requests.get(
+                    current_url,
+                    params=current_params,
+                    timeout=90
+                )
+                response.raise_for_status()
+                data = response.json()
 
-        url = next_url
-        params = None
+                all_rows.extend(data.get("data", []))
+
+                paging = data.get("paging", {})
+                next_url = paging.get("next")
+
+                if not next_url:
+                    break
+
+                current_url = next_url
+                current_params = None
+
+        except Exception as e:
+            print(f"Meta token failed for {url}: {e}")
 
     return all_rows
 
@@ -1031,7 +1072,7 @@ def get_ad_accounts():
         try:
             params = {
                 "fields": "id,account_id,name,account_status,currency,funding_source_details",
-                "access_token": ACCESS_TOKEN,
+                "access_token": ACCESS_TOKENS,
                 "limit": 500,
             }
             rows = fetch_all_pages(url, params)
@@ -1071,7 +1112,7 @@ def get_campaigns(account_id):
     url = f"{BASE_URL}/{API_VERSION}/act_{clean_id}/campaigns"
     params = {
         "fields": "id,name,status,effective_status",
-        "access_token": ACCESS_TOKEN,
+        "access_token": ACCESS_TOKENS,
         "limit": 1000,
     }
     rows = fetch_all_pages(url, params)
@@ -1086,7 +1127,7 @@ def get_campaign_creative_links(account_id):
     url = f"{BASE_URL}/{API_VERSION}/act_{clean_id}/ads"
     params = {
         "fields": "id,campaign_id,effective_status,creative{effective_object_story_id,instagram_permalink_url,effective_instagram_media_id}",
-        "access_token": ACCESS_TOKEN,
+        "access_token": ACCESS_TOKENS,
         "limit": 1000,
     }
 
@@ -1156,7 +1197,7 @@ def get_insights_for_account(account_id, since, until):
         # Critical: one insight row per calendar day, instead of one aggregate row for the whole range.
         "time_increment": 1,
         "time_range": f'{{"since":"{since}","until":"{until}"}}',
-        "access_token": ACCESS_TOKEN,
+        "access_token": ACCESS_TOKENS,
         "limit": 1000,
     }
 
@@ -1176,7 +1217,7 @@ def get_gender_spend(account_id, since, until):
         "fields": "spend",
         "breakdowns": "gender",
         "time_range": f'{{"since":"{since}","until":"{until}"}}',
-        "access_token": ACCESS_TOKEN,
+        "access_token": ACCESS_TOKENS,
         "limit": 1000,
     }
 
@@ -1201,7 +1242,7 @@ def get_age_spend(account_id, since, until):
         "fields": "spend",
         "breakdowns": "age",
         "time_range": f'{{"since":"{since}","until":"{until}"}}',
-        "access_token": ACCESS_TOKEN,
+        "access_token": ACCESS_TOKENS,
         "limit": 1000,
     }
 
@@ -1226,7 +1267,7 @@ def get_age_gender_spend(account_id, since, until):
         "fields": "spend",
         "breakdowns": "age,gender",
         "time_range": f'{{"since":"{since}","until":"{until}"}}',
-        "access_token": ACCESS_TOKEN,
+        "access_token": ACCESS_TOKENS,
         "limit": 1000,
     }
 
@@ -1282,12 +1323,25 @@ def get_account_balance(account_id):
     url = f"{BASE_URL}/{API_VERSION}/act_{clean_id}"
     params = {
         "fields": "name,funding_source_details",
-        "access_token": ACCESS_TOKEN,
+        "access_token": ACCESS_TOKENS,
     }
 
-    response = requests.get(url, params=params, timeout=90)
-    response.raise_for_status()
-    data = response.json()
+    data = {}
+    last_error = None
+
+    for token in ACCESS_TOKENS:
+        try:
+            token_params = params.copy()
+            token_params["access_token"] = token
+            response = requests.get(url, params=token_params, timeout=90)
+            response.raise_for_status()
+            data = response.json()
+            break
+        except Exception as e:
+            last_error = e
+
+    if not data and last_error:
+        raise last_error
 
     display_string = None
     if isinstance(data.get("funding_source_details"), dict):
